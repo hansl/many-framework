@@ -427,14 +427,38 @@ impl<'a> LedgerIterator<'a> {
     ) -> Self {
         use fmerk::rocksdb::{IteratorMode, ReadOptions};
         let mut opts = ReadOptions::default();
+        // According to documentation, bulk reading should set this to false.
+        opts.fill_cache(false);
+        opts.set_prefix_same_as_start(true);
 
+        let mut skip_first = false;
         match range.start_bound() {
-            Bound::Included(x) => opts.set_iterate_lower_bound(key_for_transaction(*x)),
-            Bound::Excluded(x) => opts.set_iterate_lower_bound(key_for_transaction(*x + 1)),
+            Bound::Included(x) => {
+                opts.set_iterate_lower_bound(key_for_transaction(*x));
+            }
+            Bound::Excluded(x) => {
+                // Lower bound is inclusive by default in rocksdb, so we just call `next()`
+                // on the iterator to skip the first item.
+                opts.set_iterate_lower_bound(key_for_transaction(*x));
+                skip_first = true;
+            }
             Bound::Unbounded => opts.set_iterate_lower_bound(TRANSACTIONS_ROOT),
         }
         match range.end_bound() {
-            Bound::Included(x) => opts.set_iterate_upper_bound(key_for_transaction(*x + 1)),
+            Bound::Included(x) => {
+                // By default upper bound in rocksdb is exclusive. So we "increment"
+                // the key 1 instead.
+                let mut key = key_for_transaction(*x);
+                // This cannot overflow because in the worst case the TRANSACTION_ROOT
+                // will not overflow.
+                for i in (0..key.len()).rev() {
+                    key[i] = key[i].wrapping_add(1);
+                    if key[i] != 0 {
+                        break;
+                    }
+                }
+                opts.set_iterate_upper_bound(key)
+            }
             Bound::Excluded(x) => opts.set_iterate_upper_bound(key_for_transaction(*x)),
             Bound::Unbounded => {
                 let mut bound = TRANSACTIONS_ROOT.to_vec();
@@ -448,9 +472,13 @@ impl<'a> LedgerIterator<'a> {
             SortOrder::Descending => IteratorMode::End,
         };
 
-        Self {
+        let mut result = Self {
             inner: merk.iter_opt(mode, opts),
+        };
+        if skip_first {
+            let _ = result.next();
         }
+        result
     }
 }
 
