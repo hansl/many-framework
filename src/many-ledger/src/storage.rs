@@ -1,3 +1,5 @@
+mod merk;
+
 use crate::error;
 use crate::module::validate_account;
 use many::message::ResponseMessage;
@@ -12,8 +14,6 @@ use many::server::module::{account, EmptyReturn};
 use many::types::ledger::{Symbol, TokenAmount};
 use many::types::{events, CborRange, Either, SortOrder, Timestamp};
 use many::{Identity, ManyError};
-use merk::tree::Tree;
-use merk::{rocksdb, BatchEntry, Op};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, Bound};
 use std::ops::RangeBounds;
@@ -234,6 +234,14 @@ pub(super) fn key_for_multisig_transaction(token: &[u8]) -> Vec<u8> {
     vec![MULTISIG_TRANSACTIONS_ROOT, &exp_token[..]]
         .concat()
         .to_vec()
+}
+
+pub trait LedgerStorageBackend {
+    fn get(&self, key: &[u8], check_stage: bool) -> Result<Option<Vec<u8>>, ManyError>;
+    fn hash(&self) -> Vec<u8>;
+
+    fn commit(&mut self) -> Result<(), ManyError>;
+    fn put(&mut self, key: Vec<u8>, value: Vec<u8>);
 }
 
 pub struct LedgerStorage {
@@ -707,8 +715,8 @@ impl LedgerStorage {
 
         // Set the multisig threshold properly.
         if let Ok(mut multisig) = account.features.get::<multisig::MultisigAccountFeature>() {
-            multisig.arg.threshold =
-                Some(multisig.arg.threshold.unwrap_or(
+            multisig.arg.threshold = Some(
+                multisig.arg.threshold.unwrap_or(
                     account
                         .roles
                         .iter()
@@ -718,7 +726,8 @@ impl LedgerStorage {
                                 || roles.contains(&account::Role::CanMultisigSubmit)
                         })
                         .count() as u64,
-                ));
+                ),
+            );
             multisig.arg.timeout_in_secs = Some(
                 multisig
                     .arg
