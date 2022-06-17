@@ -241,6 +241,9 @@ pub enum Direction {
     Backward,
 }
 
+pub type LedgerStorageBackendIter<'a> =
+    Box<dyn Iterator<Item = (Cow<'a, [u8]>, Cow<'a, [u8]>)> + 'a>;
+
 pub trait LedgerStorageBackend {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, ManyError>;
     fn get_staged(&self, key: &[u8]) -> Result<Option<Vec<u8>>, ManyError>;
@@ -249,16 +252,13 @@ pub trait LedgerStorageBackend {
     fn commit(&mut self) -> Result<(), ManyError>;
     fn put(&mut self, key: Vec<u8>, value: Vec<u8>);
 
-    fn iter<'a>(
-        &'a self,
+    fn iter(
+        &self,
         start: Bound<Vec<u8>>,
         end: Bound<Vec<u8>>,
         direction: Direction,
-    ) -> Box<dyn Iterator<Item = (Cow<[u8]>, Cow<[u8]>)> + 'a>;
-    fn iter_prefix<'a>(
-        &'a self,
-        prefix: Vec<u8>,
-    ) -> Box<dyn Iterator<Item = (Cow<[u8]>, Cow<[u8]>)> + 'a> {
+    ) -> LedgerStorageBackendIter;
+    fn iter_prefix(&self, prefix: Vec<u8>) -> LedgerStorageBackendIter {
         let mut end = prefix.clone();
 
         for x in (0..end.len() - 1).rev() {
@@ -269,7 +269,7 @@ pub trait LedgerStorageBackend {
         }
 
         self.iter(
-            Bound::Included(prefix.clone()),
+            Bound::Included(prefix),
             Bound::Excluded(end),
             Direction::Forward,
         )
@@ -595,7 +595,7 @@ impl<T: LedgerStorageBackend> LedgerStorage<T> {
             TokenAmount::zero()
         } else {
             let key = key_for_account_balance(identity, symbol);
-            match self.persistent_store.get(&key).unwrap() {
+            match self.persistent_store.get_staged(&key).unwrap() {
                 None => TokenAmount::zero(),
                 Some(amount) => TokenAmount::from(amount),
             }
@@ -611,7 +611,7 @@ impl<T: LedgerStorageBackend> LedgerStorage<T> {
             for symbol in self.symbols.keys() {
                 match self
                     .persistent_store
-                    .get(&key_for_account_balance(identity, symbol))
+                    .get_staged(&key_for_account_balance(identity, symbol))
                 {
                     Ok(None) => {}
                     Ok(Some(value)) => {
@@ -913,7 +913,7 @@ impl<T: LedgerStorageBackend> LedgerStorage<T> {
 
     pub fn get_account_even_disabled(&self, id: &Identity) -> Option<account::Account> {
         self.persistent_store
-            .get(&key_for_account(id))
+            .get_staged(&key_for_account(id))
             .unwrap_or_default()
             .as_ref()
             .and_then(|bytes| {
@@ -1056,7 +1056,7 @@ impl<T: LedgerStorageBackend> LedgerStorage<T> {
     pub fn get_multisig_info(&self, tx_id: &[u8]) -> Result<MultisigTransactionStorage, ManyError> {
         let storage_bytes = self
             .persistent_store
-            .get(&key_for_multisig_transaction(tx_id))
+            .get_staged(&key_for_multisig_transaction(tx_id))
             .unwrap_or(None)
             .ok_or_else(multisig::errors::transaction_cannot_be_found)?;
         minicbor::decode::<MultisigTransactionStorage>(&storage_bytes)
@@ -1252,7 +1252,7 @@ impl<T: LedgerStorageBackend> LedgerStorage<T> {
             .map_err(|e| ManyError::serialization_error(e.to_string()))?;
         if self
             .persistent_store
-            .get(&recall_phrase_cbor)
+            .get_staged(&recall_phrase_cbor)
             .map_err(|e| ManyError::unknown(e.to_string()))?
             .is_some()
         {
@@ -1296,7 +1296,7 @@ impl<T: LedgerStorageBackend> LedgerStorage<T> {
         sep: IdStoreRootSeparator,
     ) -> Result<Option<Vec<u8>>, ManyError> {
         self.persistent_store
-            .get(&vec![IDSTORE_ROOT, sep.value(), key].concat())
+            .get_staged(&vec![IDSTORE_ROOT, sep.value(), key].concat())
             .map_err(|e| ManyError::unknown(e.to_string()))
     }
 
@@ -1334,7 +1334,7 @@ impl<T: LedgerStorageBackend> LedgerStorage<T> {
 }
 
 pub struct LedgerIterator<'a> {
-    inner: Box<dyn Iterator<Item = (Cow<'a, [u8]>, Cow<'a, [u8]>)> + 'a>,
+    inner: LedgerStorageBackendIter<'a>,
 }
 
 impl<'a> LedgerIterator<'a> {
