@@ -185,12 +185,12 @@ impl IdStoreRootSeparator {
     }
 }
 
-pub(crate) const TRANSACTIONS_ROOT: &[u8] = b"/transactions/";
+pub(crate) const EVENTS_ROOT: &[u8] = b"/events/";
 pub(crate) const MULTISIG_TRANSACTIONS_ROOT: &[u8] = b"/multisig/";
 pub(crate) const IDSTORE_ROOT: &[u8] = b"/idstore/";
 
 // Left-shift the height by this amount of bits
-const HEIGHT_TXID_SHIFT: u64 = 32;
+const HEIGHT_EVENTID_SHIFT: u64 = 32;
 
 /// Number of bytes in an event ID when serialized. Keys smaller than this
 /// will have `\0` prepended, and keys larger will be cut to this number of
@@ -202,7 +202,7 @@ pub(super) fn key_for_account_balance(id: &Identity, symbol: &Symbol) -> Vec<u8>
     format!("/balances/{}/{}", id, symbol).into_bytes()
 }
 
-/// Returns the storage key for a transaction in the kv-store.
+/// Returns the storage key for an event in the kv-store.
 pub(super) fn key_for_event(id: events::EventId) -> Vec<u8> {
     let id = id.as_ref();
     let id = if id.len() > EVENT_ID_KEY_SIZE_IN_BYTES {
@@ -213,7 +213,7 @@ pub(super) fn key_for_event(id: events::EventId) -> Vec<u8> {
 
     let mut exp_id = [0u8; EVENT_ID_KEY_SIZE_IN_BYTES];
     exp_id[(EVENT_ID_KEY_SIZE_IN_BYTES - id.len())..].copy_from_slice(id);
-    vec![TRANSACTIONS_ROOT.to_vec(), exp_id.to_vec()].concat()
+    vec![EVENTS_ROOT.to_vec(), exp_id.to_vec()].concat()
 }
 
 pub(super) fn key_for_account(id: &Identity) -> Vec<u8> {
@@ -368,7 +368,7 @@ impl LedgerStorage<MerkStorageBackend> {
                 u64::from_be_bytes(bytes)
             });
 
-        let latest_tid = events::EventId::from(height << HEIGHT_TXID_SHIFT);
+        let latest_tid = events::EventId::from(height << HEIGHT_EVENTID_SHIFT);
 
         Ok(Self {
             symbols,
@@ -518,7 +518,7 @@ impl<T: LedgerStorageBackend> LedgerStorage<T> {
                     }
                 }
             } else if let Ok(d) = now.duration_since(storage.creation) {
-                // Since the DB is ordered by transaction ID (keys), at this point we don't need
+                // Since the DB is ordered by event ID (keys), at this point we don't need
                 // to continue since we know that the rest is all timed out anyway.
                 if d.as_secs() > MULTISIG_MAXIMUM_TIMEOUT_IN_SECS {
                     break;
@@ -549,7 +549,7 @@ impl<T: LedgerStorageBackend> LedgerStorage<T> {
         let hash = self.persistent_store.hash();
         self.current_hash = Some(hash.clone());
 
-        self.latest_tid = events::EventId::from(height << HEIGHT_TXID_SHIFT);
+        self.latest_tid = events::EventId::from(height << HEIGHT_EVENTID_SHIFT);
 
         AbciCommitInfo {
             retain_height,
@@ -559,7 +559,7 @@ impl<T: LedgerStorageBackend> LedgerStorage<T> {
 
     pub fn nb_events(&self) -> u64 {
         self.persistent_store
-            .get(b"/transactions_count")
+            .get(b"/events_count")
             .unwrap()
             .map_or(0, |x| {
                 let mut bytes = [0u8; 8];
@@ -569,21 +569,20 @@ impl<T: LedgerStorageBackend> LedgerStorage<T> {
     }
 
     fn log_event(&mut self, content: events::EventInfo) {
-        let current_nb_transactions = self.nb_events();
-        let transaction = events::EventLog {
+        let current_nb_events = self.nb_events();
+        let event = events::EventLog {
             id: self.new_event_id(),
             time: self.now().into(),
             content,
         };
 
         self.persistent_store.put(
-            key_for_event(transaction.id.clone()),
-            minicbor::to_vec(&transaction).unwrap(),
+            key_for_event(event.id.clone()),
+            minicbor::to_vec(&event).unwrap(),
         );
-
         self.persistent_store.put(
-            b"/transactions_count".to_vec(),
-            (current_nb_transactions + 1).to_be_bytes().to_vec(),
+            b"/events_count".to_vec(),
+            (current_nb_events + 1).to_be_bytes().to_vec(),
         );
 
         if !self.blockchain {
@@ -705,14 +704,14 @@ impl<T: LedgerStorageBackend> LedgerStorage<T> {
     pub(crate) fn _add_account(
         &mut self,
         mut account: account::Account,
-        add_transaction: bool,
+        add_event: bool,
     ) -> Result<Identity, ManyError> {
         let id = self.new_account_id();
 
         // Set the multisig threshold properly.
         if let Ok(mut multisig) = account.features.get::<multisig::MultisigAccountFeature>() {
-            multisig.arg.threshold = Some(
-                multisig.arg.threshold.unwrap_or(
+            multisig.arg.threshold =
+                Some(multisig.arg.threshold.unwrap_or(
                     account
                         .roles
                         .iter()
@@ -722,8 +721,7 @@ impl<T: LedgerStorageBackend> LedgerStorage<T> {
                                 || roles.contains(&account::Role::CanMultisigSubmit)
                         })
                         .count() as u64,
-                ),
-            );
+                ));
             multisig.arg.timeout_in_secs = Some(
                 multisig
                     .arg
@@ -742,7 +740,7 @@ impl<T: LedgerStorageBackend> LedgerStorage<T> {
             account.features.insert(multisig.as_feature());
         }
 
-        if add_transaction {
+        if add_event {
             self.log_event(events::EventInfo::AccountCreate {
                 account: id,
                 description: account.clone().description,
@@ -1352,14 +1350,14 @@ impl<'a> LedgerIterator<'a> {
             match range.start {
                 Bound::Included(s) => Bound::Included(key_for_event(s)),
                 Bound::Excluded(s) => Bound::Excluded(key_for_event(s)),
-                Bound::Unbounded => Bound::Included(TRANSACTIONS_ROOT.to_vec()),
+                Bound::Unbounded => Bound::Included(EVENTS_ROOT.to_vec()),
             },
             match range.end {
                 Bound::Included(e) => Bound::Included(key_for_event(e)),
                 Bound::Excluded(e) => Bound::Excluded(key_for_event(e)),
                 Bound::Unbounded => {
-                    let mut bound = TRANSACTIONS_ROOT.to_vec();
-                    bound[TRANSACTIONS_ROOT.len() - 1] += 1;
+                    let mut bound = EVENTS_ROOT.to_vec();
+                    bound[EVENTS_ROOT.len() - 1] += 1;
                     Bound::Included(bound)
                 }
             },
@@ -1410,7 +1408,7 @@ pub mod tests {
             key_for_event(EventId::from(b"012345678901234567890123456789".to_vec())).len()
         );
 
-        // Trim the Tx ID if it's too long.
+        // Trim the Event ID if it's too long.
         assert_eq!(
             golden_size,
             key_for_event(EventId::from(
