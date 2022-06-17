@@ -1,5 +1,5 @@
 use crate::error;
-use crate::storage::LedgerStorage;
+use crate::storage::{LedgerStorage, LedgerStorageBackend};
 use many::server::module::account;
 use many::server::module::account::features;
 use many::server::module::account::features::{FeatureInfo, TryCreateFeature};
@@ -79,7 +79,10 @@ pub struct AccountJson {
 }
 
 impl AccountJson {
-    pub fn create_account(&self, ledger: &mut LedgerStorage) -> Result<(), ManyError> {
+    pub fn create_account<T: LedgerStorageBackend>(
+        &self,
+        ledger: &mut LedgerStorage<T>,
+    ) -> Result<(), ManyError> {
         let id = ledger._add_account(
             account::Account {
                 description: self.description.clone(),

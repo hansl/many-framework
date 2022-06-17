@@ -2,11 +2,12 @@ use many::types::events::{EventId, EventLog};
 use many::types::ledger::TokenAmount;
 use many::types::{CborRange, SortOrder};
 use many::Identity;
+use many_ledger::storage::merk::MerkStorageBackend;
 use many_ledger::storage::LedgerStorage;
 use std::collections::BTreeMap;
 use std::ops::Bound;
 
-fn setup() -> LedgerStorage {
+fn setup() -> LedgerStorage<MerkStorageBackend> {
     let symbol0 = Identity::anonymous();
     let id0 = Identity::public_key_raw([0; 28]);
     let id1 = Identity::public_key_raw([1; 28]);
@@ -31,7 +32,7 @@ fn setup() -> LedgerStorage {
 }
 
 fn iter_asc(
-    storage: &LedgerStorage,
+    storage: &LedgerStorage<MerkStorageBackend>,
     start: Bound<EventId>,
     end: Bound<EventId>,
 ) -> impl Iterator<Item = EventLog> + '_ {

@@ -1,7 +1,8 @@
-mod merk;
+pub mod merk;
 
 use crate::error;
 use crate::module::validate_account;
+use crate::storage::merk::MerkStorageBackend;
 use many::message::ResponseMessage;
 use many::server::module;
 use many::server::module::abci_backend::AbciCommitInfo;
@@ -14,15 +15,14 @@ use many::server::module::{account, EmptyReturn};
 use many::types::ledger::{Symbol, TokenAmount};
 use many::types::{events, CborRange, Either, SortOrder, Timestamp};
 use many::{Identity, ManyError};
-use std::cmp::Ordering;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, Bound};
-use std::ops::RangeBounds;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 use tracing::{info, warn};
 
-fn _execute_multisig_tx(
-    ledger: &mut LedgerStorage,
+fn _execute_multisig_tx<T: LedgerStorageBackend>(
+    ledger: &mut LedgerStorage<T>,
     _tx_id: &[u8],
     storage: &MultisigTransactionStorage,
 ) -> Result<Vec<u8>, ManyError> {
@@ -236,17 +236,49 @@ pub(super) fn key_for_multisig_transaction(token: &[u8]) -> Vec<u8> {
         .to_vec()
 }
 
+pub enum Direction {
+    Forward,
+    Backward,
+}
+
 pub trait LedgerStorageBackend {
-    fn get(&self, key: &[u8], check_stage: bool) -> Result<Option<Vec<u8>>, ManyError>;
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, ManyError>;
+    fn get_staged(&self, key: &[u8]) -> Result<Option<Vec<u8>>, ManyError>;
     fn hash(&self) -> Vec<u8>;
 
     fn commit(&mut self) -> Result<(), ManyError>;
     fn put(&mut self, key: Vec<u8>, value: Vec<u8>);
+
+    fn iter<'a>(
+        &'a self,
+        start: Bound<Vec<u8>>,
+        end: Bound<Vec<u8>>,
+        direction: Direction,
+    ) -> Box<dyn Iterator<Item = (Cow<[u8]>, Cow<[u8]>)> + 'a>;
+    fn iter_prefix<'a>(
+        &'a self,
+        prefix: Vec<u8>,
+    ) -> Box<dyn Iterator<Item = (Cow<[u8]>, Cow<[u8]>)> + 'a> {
+        let mut end = prefix.clone();
+
+        for x in (0..end.len() - 1).rev() {
+            if end[x] != 0xFF {
+                end[x] += 1;
+                break;
+            }
+        }
+
+        self.iter(
+            Bound::Included(prefix.clone()),
+            Bound::Excluded(end),
+            Direction::Forward,
+        )
+    }
 }
 
-pub struct LedgerStorage {
+pub struct LedgerStorage<T: LedgerStorageBackend> {
     symbols: BTreeMap<Symbol, String>,
-    persistent_store: merk::Merk,
+    persistent_store: T,
 
     /// When this is true, we do not commit every transactions as they come,
     /// but wait for a `commit` call before committing the batch to the
@@ -264,7 +296,7 @@ pub struct LedgerStorage {
     idstore_seed: u64,
 }
 
-impl LedgerStorage {
+impl<T: LedgerStorageBackend> LedgerStorage<T> {
     #[cfg(feature = "balance_testing")]
     pub(crate) fn set_balance_only_for_testing(
         &mut self,
@@ -279,16 +311,14 @@ impl LedgerStorage {
         let key = key_for_account_balance(&account, &symbol);
         let amount = TokenAmount::from(amount);
 
-        self.persistent_store
-            .apply(&[(key, Op::Put(amount.to_vec()))])
-            .unwrap();
+        self.persistent_store.put(key, amount.to_vec());
 
         // Always commit to the store. In blockchain mode this will fail.
-        self.persistent_store.commit(&[]).unwrap();
+        self.persistent_store.commit().expect("Could not commit.");
     }
 }
 
-impl std::fmt::Debug for LedgerStorage {
+impl<T: LedgerStorageBackend> std::fmt::Debug for LedgerStorage<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LedgerStorage")
             .field("symbols", &self.symbols)
@@ -296,18 +326,9 @@ impl std::fmt::Debug for LedgerStorage {
     }
 }
 
-impl LedgerStorage {
-    #[inline]
-    pub fn set_time(&mut self, time: SystemTime) {
-        self.current_time = Some(time);
-    }
-    #[inline]
-    pub fn now(&self) -> SystemTime {
-        self.current_time.unwrap_or_else(SystemTime::now)
-    }
-
+impl LedgerStorage<MerkStorageBackend> {
     pub fn load<P: AsRef<Path>>(persistent_path: P, blockchain: bool) -> Result<Self, String> {
-        let persistent_store = merk::Merk::open(persistent_path).map_err(|e| e.to_string())?;
+        let persistent_store = MerkStorageBackend::load(persistent_path).expect("Could not load");
 
         let symbols = persistent_store
             .get(b"/config/symbols")
@@ -369,9 +390,8 @@ impl LedgerStorage {
         identity: Identity,
         blockchain: bool,
     ) -> Result<Self, String> {
-        let mut persistent_store = merk::Merk::open(persistent_path).map_err(|e| e.to_string())?;
-
-        let mut batch: Vec<BatchEntry> = Vec::new();
+        let mut persistent_store =
+            MerkStorageBackend::create(persistent_path).map_err(|e| e.to_string())?;
 
         for (k, v) in initial_balances.into_iter() {
             for (symbol, tokens) in v.into_iter() {
@@ -380,20 +400,17 @@ impl LedgerStorage {
                 }
 
                 let key = key_for_account_balance(&k, &symbol);
-                batch.push((key, Op::Put(tokens.to_vec())));
+                persistent_store.put(key, tokens.to_vec());
             }
         }
 
-        batch.push((b"/config/identity".to_vec(), Op::Put(identity.to_vec())));
-        batch.push((
+        persistent_store.put(b"/config/identity".to_vec(), identity.to_vec());
+        persistent_store.put(
             b"/config/symbols".to_vec(),
-            Op::Put(minicbor::to_vec(&symbols).map_err(|e| e.to_string())?),
-        ));
+            minicbor::to_vec(&symbols).map_err(|e| e.to_string())?,
+        );
 
-        persistent_store
-            .apply(batch.as_slice())
-            .map_err(|e| e.to_string())?;
-        persistent_store.commit(&[]).map_err(|e| e.to_string())?;
+        persistent_store.commit().map_err(|e| e.to_string())?;
 
         Ok(Self {
             symbols,
@@ -407,9 +424,20 @@ impl LedgerStorage {
             idstore_seed: 0,
         })
     }
+}
+
+impl<T: LedgerStorageBackend> LedgerStorage<T> {
+    #[inline]
+    pub fn set_time(&mut self, time: SystemTime) {
+        self.current_time = Some(time);
+    }
+    #[inline]
+    pub fn now(&self) -> SystemTime {
+        self.current_time.unwrap_or_else(SystemTime::now)
+    }
 
     pub fn commit_persistent_store(&mut self) -> Result<(), String> {
-        self.persistent_store.commit(&[]).map_err(|e| e.to_string())
+        self.persistent_store.commit().map_err(|e| e.to_string())
     }
 
     pub fn get_symbols(&self) -> BTreeMap<Symbol, String> {
@@ -418,12 +446,10 @@ impl LedgerStorage {
 
     fn inc_height(&mut self) -> u64 {
         let current_height = self.get_height();
-        self.persistent_store
-            .apply(&[(
-                b"/height".to_vec(),
-                Op::Put((current_height + 1).to_be_bytes().to_vec()),
-            )])
-            .unwrap();
+        self.persistent_store.put(
+            b"/height".to_vec(),
+            (current_height + 1).to_be_bytes().to_vec(),
+        );
         current_height
     }
 
@@ -441,12 +467,10 @@ impl LedgerStorage {
     fn new_account_id(&mut self) -> Identity {
         let current_id = self.next_account_id;
         self.next_account_id += 1;
-        self.persistent_store
-            .apply(&[(
-                b"/config/account_id".to_vec(),
-                Op::Put(self.next_account_id.to_be_bytes().to_vec()),
-            )])
-            .unwrap();
+        self.persistent_store.put(
+            b"/config/account_id".to_vec(),
+            self.next_account_id.to_be_bytes().to_vec(),
+        );
 
         self.account_identity
             .with_subresource_id(current_id)
@@ -456,15 +480,13 @@ impl LedgerStorage {
     pub(crate) fn inc_idstore_seed(&mut self) -> u64 {
         let current_seed = self.idstore_seed;
         self.idstore_seed += 1;
-        self.persistent_store
-            .apply(&[(
-                b"/config/idstore_seed".to_vec(),
-                Op::Put(self.idstore_seed.to_be_bytes().to_vec()),
-            )])
-            .unwrap();
+        self.persistent_store.put(
+            b"/config/idstore_seed".to_vec(),
+            self.idstore_seed.to_be_bytes().to_vec(),
+        );
 
         if !self.blockchain {
-            self.persistent_store.commit(&[]).unwrap();
+            self.persistent_store.commit().unwrap();
         }
 
         current_seed
@@ -476,25 +498,14 @@ impl LedgerStorage {
     }
 
     pub fn check_timed_out_multisig_transactions(&mut self) -> Result<(), ManyError> {
-        use rocksdb::{Direction, IteratorMode, ReadOptions};
-
-        // Set the iterator bounds to iterate all multisig transactions.
-        // We will break the loop later if we can.
-        let mut options = ReadOptions::default();
-        options.set_iterate_lower_bound(MULTISIG_TRANSACTIONS_ROOT);
-        let mut bound = MULTISIG_TRANSACTIONS_ROOT.to_vec();
-        bound[MULTISIG_TRANSACTIONS_ROOT.len() - 1] += 1;
-
         let it = self
             .persistent_store
-            .iter_opt(IteratorMode::From(&bound, Direction::Reverse), options);
+            .iter_prefix(MULTISIG_TRANSACTIONS_ROOT.to_vec());
 
-        let mut batch = vec![];
+        let mut all = Vec::<(Vec<u8>, Vec<u8>)>::with_capacity(64);
 
         for (k, v) in it {
-            let v = Tree::decode(k.to_vec(), v.as_ref());
-
-            let mut storage: MultisigTransactionStorage = minicbor::decode(v.value())
+            let mut storage: MultisigTransactionStorage = minicbor::decode(v.as_ref())
                 .map_err(|e| ManyError::deserialization_error(e.to_string()))?;
             let now = self.now();
 
@@ -503,7 +514,7 @@ impl LedgerStorage {
                     storage.disable(MultisigTransactionState::Expired);
 
                     if let Ok(v) = minicbor::to_vec(storage) {
-                        batch.push((k.to_vec(), Op::Put(v)));
+                        all.push((k.to_vec(), v.to_owned()));
                     }
                 }
             } else if let Ok(d) = now.duration_since(storage.creation) {
@@ -515,14 +526,12 @@ impl LedgerStorage {
             }
         }
 
-        if !batch.is_empty() {
-            // Reverse the batch so keys are in sorted order.
-            batch.reverse();
-            self.persistent_store.apply(&batch).unwrap();
+        for (k, v) in all {
+            self.persistent_store.put(k, v);
         }
 
         if !self.blockchain {
-            self.persistent_store.commit(&[]).unwrap();
+            self.persistent_store.commit().unwrap();
         }
 
         Ok(())
@@ -535,9 +544,9 @@ impl LedgerStorage {
 
         let height = self.inc_height();
         let retain_height = 0;
-        self.persistent_store.commit(&[]).unwrap();
+        self.persistent_store.commit().unwrap();
 
-        let hash = self.persistent_store.root_hash().to_vec();
+        let hash = self.persistent_store.hash();
         self.current_hash = Some(hash.clone());
 
         self.latest_tid = events::EventId::from(height << HEIGHT_TXID_SHIFT);
@@ -567,21 +576,18 @@ impl LedgerStorage {
             content,
         };
 
-        self.persistent_store
-            .apply(&[
-                (
-                    key_for_event(transaction.id.clone()),
-                    Op::Put(minicbor::to_vec(&transaction).unwrap()),
-                ),
-                (
-                    b"/transactions_count".to_vec(),
-                    Op::Put((current_nb_transactions + 1).to_be_bytes().to_vec()),
-                ),
-            ])
-            .unwrap();
+        self.persistent_store.put(
+            key_for_event(transaction.id.clone()),
+            minicbor::to_vec(&transaction).unwrap(),
+        );
+
+        self.persistent_store.put(
+            b"/transactions_count".to_vec(),
+            (current_nb_transactions + 1).to_be_bytes().to_vec(),
+        );
 
         if !self.blockchain {
-            self.persistent_store.commit(&[]).unwrap();
+            self.persistent_store.commit().unwrap();
         }
     }
 
@@ -669,18 +675,8 @@ impl LedgerStorage {
         let key_from = key_for_account_balance(from, symbol);
         let key_to = key_for_account_balance(to, symbol);
 
-        let batch: Vec<BatchEntry> = match key_from.cmp(&key_to) {
-            Ordering::Less | Ordering::Equal => vec![
-                (key_from, Op::Put(amount_from.to_vec())),
-                (key_to, Op::Put(amount_to.to_vec())),
-            ],
-            _ => vec![
-                (key_to, Op::Put(amount_to.to_vec())),
-                (key_from, Op::Put(amount_from.to_vec())),
-            ],
-        };
-
-        self.persistent_store.apply(&batch).unwrap();
+        self.persistent_store.put(key_from, amount_from.to_vec());
+        self.persistent_store.put(key_to, amount_to.to_vec());
 
         self.log_event(events::EventInfo::Send {
             from: *from,
@@ -690,7 +686,7 @@ impl LedgerStorage {
         });
 
         if !self.blockchain {
-            self.persistent_store.commit(&[]).unwrap();
+            self.persistent_store.commit().unwrap();
         }
 
         Ok(())
@@ -699,7 +695,7 @@ impl LedgerStorage {
     pub fn hash(&self) -> Vec<u8> {
         self.current_hash
             .as_ref()
-            .map_or_else(|| self.persistent_store.root_hash().to_vec(), |x| x.clone())
+            .map_or_else(|| self.persistent_store.hash(), |x| x.clone())
     }
 
     pub fn iter(&self, range: CborRange<events::EventId>, order: SortOrder) -> LedgerIterator {
@@ -816,7 +812,7 @@ impl LedgerStorage {
 
             if !self.blockchain {
                 self.persistent_store
-                    .commit(&[])
+                    .commit()
                     .expect("Could not commit to store.");
             }
 
@@ -936,20 +932,13 @@ impl LedgerStorage {
     ) -> Result<(), ManyError> {
         tracing::debug!("commit({:?})", account);
 
-        self.persistent_store
-            .apply(&[(
-                key_for_account(id),
-                Op::Put(
-                    minicbor::to_vec(account)
-                        .map_err(|e| ManyError::serialization_error(e.to_string()))?,
-                ),
-            )])
-            .map_err(|e| ManyError::unknown(e.to_string()))?;
+        self.persistent_store.put(
+            key_for_account(id),
+            minicbor::to_vec(account).map_err(|e| ManyError::serialization_error(e.to_string()))?,
+        );
 
         if !self.blockchain {
-            self.persistent_store
-                .commit(&[])
-                .expect("Could not commit to store.");
+            self.persistent_store.commit()?;
         }
         Ok(())
     }
@@ -959,20 +948,13 @@ impl LedgerStorage {
         tx_id: &[u8],
         tx: &MultisigTransactionStorage,
     ) -> Result<(), ManyError> {
-        self.persistent_store
-            .apply(&[(
-                key_for_multisig_transaction(tx_id),
-                Op::Put(
-                    minicbor::to_vec(tx)
-                        .map_err(|e| ManyError::serialization_error(e.to_string()))?,
-                ),
-            )])
-            .unwrap();
+        self.persistent_store.put(
+            key_for_multisig_transaction(tx_id),
+            minicbor::to_vec(tx).map_err(|e| ManyError::serialization_error(e.to_string()))?,
+        );
 
         if !self.blockchain {
-            self.persistent_store
-                .commit(&[])
-                .expect("Could not commit to store.");
+            self.persistent_store.commit()?;
         }
         Ok(())
     }
@@ -1229,12 +1211,9 @@ impl LedgerStorage {
             minicbor::to_vec(storage).map_err(|e| ManyError::serialization_error(e.to_string()))?;
 
         self.persistent_store
-            .apply(&[(key_for_multisig_transaction(tx_id), Op::Put(v))])
-            .unwrap();
+            .put(key_for_multisig_transaction(tx_id), v);
         if !self.blockchain {
-            self.persistent_store
-                .commit(&[])
-                .expect("Could not commit to store.");
+            self.persistent_store.commit()?;
         }
         Ok(())
     }
@@ -1287,33 +1266,27 @@ impl LedgerStorage {
         })
         .map_err(|e| ManyError::serialization_error(e.to_string()))?;
 
-        let batch = vec![
-            (
-                vec![
-                    IDSTORE_ROOT,
-                    IdStoreRootSeparator::RecallPhrase.value(),
-                    &recall_phrase_cbor,
-                ]
-                .concat(),
-                Op::Put(value.clone()),
-            ),
-            (
-                vec![
-                    IDSTORE_ROOT,
-                    IdStoreRootSeparator::Address.value(),
-                    &address.to_vec(),
-                ]
-                .concat(),
-                Op::Put(value),
-            ),
-        ];
-
-        self.persistent_store.apply(&batch).unwrap();
+        self.persistent_store.put(
+            vec![
+                IDSTORE_ROOT,
+                IdStoreRootSeparator::RecallPhrase.value(),
+                &recall_phrase_cbor,
+            ]
+            .concat(),
+            value.clone(),
+        );
+        self.persistent_store.put(
+            vec![
+                IDSTORE_ROOT,
+                IdStoreRootSeparator::Address.value(),
+                &address.to_vec(),
+            ]
+            .concat(),
+            value,
+        );
 
         if !self.blockchain {
-            self.persistent_store
-                .commit(&[])
-                .expect("Could not commit to store.");
+            self.persistent_store.commit()?;
         }
 
         Ok(())
@@ -1363,53 +1336,48 @@ impl LedgerStorage {
 }
 
 pub struct LedgerIterator<'a> {
-    inner: rocksdb::DBIterator<'a>,
+    inner: Box<dyn Iterator<Item = (Cow<'a, [u8]>, Cow<'a, [u8]>)> + 'a>,
 }
 
 impl<'a> LedgerIterator<'a> {
-    pub fn scoped_by_id(
-        merk: &'a merk::Merk,
+    pub fn scoped_by_id<B: LedgerStorageBackend>(
+        backend: &'a B,
         range: CborRange<events::EventId>,
         order: SortOrder,
-    ) -> Self {
-        use rocksdb::{IteratorMode, ReadOptions};
-        let mut opts = ReadOptions::default();
+    ) -> Self
+    where
+        Self: 'a,
+    {
+        let inner = backend.iter(
+            match range.start {
+                Bound::Included(s) => Bound::Included(key_for_event(s)),
+                Bound::Excluded(s) => Bound::Excluded(key_for_event(s)),
+                Bound::Unbounded => Bound::Included(TRANSACTIONS_ROOT.to_vec()),
+            },
+            match range.end {
+                Bound::Included(e) => Bound::Included(key_for_event(e)),
+                Bound::Excluded(e) => Bound::Excluded(key_for_event(e)),
+                Bound::Unbounded => {
+                    let mut bound = TRANSACTIONS_ROOT.to_vec();
+                    bound[TRANSACTIONS_ROOT.len() - 1] += 1;
+                    Bound::Included(bound)
+                }
+            },
+            match order {
+                SortOrder::Indeterminate | SortOrder::Ascending => Direction::Forward,
+                SortOrder::Descending => Direction::Backward,
+            },
+        );
 
-        match range.start_bound() {
-            Bound::Included(x) => opts.set_iterate_lower_bound(key_for_event(x.clone())),
-            Bound::Excluded(x) => opts.set_iterate_lower_bound(key_for_event(x.clone() + 1)),
-            Bound::Unbounded => opts.set_iterate_lower_bound(TRANSACTIONS_ROOT),
-        }
-        match range.end_bound() {
-            Bound::Included(x) => opts.set_iterate_upper_bound(key_for_event(x.clone() + 1)),
-            Bound::Excluded(x) => opts.set_iterate_upper_bound(key_for_event(x.clone())),
-            Bound::Unbounded => {
-                let mut bound = TRANSACTIONS_ROOT.to_vec();
-                bound[TRANSACTIONS_ROOT.len() - 1] += 1;
-                opts.set_iterate_upper_bound(bound);
-            }
-        }
-
-        let mode = match order {
-            SortOrder::Indeterminate | SortOrder::Ascending => IteratorMode::Start,
-            SortOrder::Descending => IteratorMode::End,
-        };
-
-        Self {
-            inner: merk.iter_opt(mode, opts),
-        }
+        Self { inner }
     }
 }
 
 impl<'a> Iterator for LedgerIterator<'a> {
-    type Item = (Box<[u8]>, Vec<u8>);
+    type Item = (Cow<'a, [u8]>, Cow<'a, [u8]>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|(k, v)| {
-            let new_v = Tree::decode(k.to_vec(), v.as_ref());
-
-            (k, new_v.value().to_vec())
-        })
+        self.inner.next()
     }
 }
 
@@ -1418,7 +1386,7 @@ pub mod tests {
     use super::*;
     use many::types::events::EventId;
 
-    impl LedgerStorage {
+    impl<T: LedgerStorageBackend> LedgerStorage<T> {
         pub fn set_idstore_seed(&mut self, seed: u64) {
             self.idstore_seed = seed;
         }

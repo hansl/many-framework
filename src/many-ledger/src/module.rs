@@ -1,4 +1,5 @@
 use crate::json::InitialStateJson;
+use crate::storage::merk::MerkStorageBackend;
 use crate::{error, storage::LedgerStorage};
 use coset::{CborSerializable, CoseKey, CoseSign1};
 use many::message::error::ManyErrorCode;
@@ -163,7 +164,7 @@ fn filter_date<'a>(
 /// A simple ledger that keeps transactions in memory.
 #[derive(Debug)]
 pub struct LedgerModuleImpl {
-    storage: LedgerStorage,
+    storage: LedgerStorage<MerkStorageBackend>,
 }
 
 impl LedgerModuleImpl {
@@ -313,7 +314,7 @@ impl module::events::EventsModuleBackend for LedgerModuleImpl {
     ) -> Result<module::events::InfoReturn, ManyError> {
         Ok(module::events::InfoReturn {
             total: self.storage.nb_events(),
-            event_types: events::EventKind::iter().collect(),
+            event_types: vec![], //events::EventKind::iter().collect(),
         })
     }
 
@@ -340,7 +341,7 @@ impl module::events::EventsModuleBackend for LedgerModuleImpl {
         );
 
         let iter = Box::new(iter.map(|(_k, v)| {
-            decode::<events::EventLog>(v.as_slice())
+            decode::<events::EventLog>(v.as_ref())
                 .map_err(|e| ManyError::deserialization_error(e.to_string()))
         }));
 
